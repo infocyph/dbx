@@ -12,4 +12,5 @@ python3 - "$ROOT/tests/fixtures/mock-llm/server.py" <<'PY'
 import ast, pathlib, sys
 ast.parse(pathlib.Path(sys.argv[1]).read_text())
 PY
+bash "$ROOT/tests/workflow-contract.sh"
 printf 'Static checks passed.\n'

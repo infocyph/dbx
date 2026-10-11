@@ -86,7 +86,8 @@ activation, preserving manual connections and edits, opt-outs, and deletion pers
 The Check workflow validates both supported architectures. Docker Publish runs on
 a published stable release, manual dispatch, and weekly refresh. Manual/scheduled
 runs use the latest stable release source and update only `latest`; release tags
-are immutable. Both architecture candidates pass the smoke test before publication.
+are immutable. Published release names are preserved as image tags, including
+versions such as `0.01`; tags must satisfy Docker's image tag format. Both architecture candidates pass the smoke test before publication.
 The upstream DBX image is resolved to one digest for the whole publish run.
 
 Configure repository secrets `DOCKER_USERNAME` and `DOCKER_PASSWORD` for Docker Hub.

@@ -43,7 +43,13 @@ jobs:
             [[ "$(jq -r .prerelease <<<"$release")" == false ]]
             source_tag="$(jq -r .tag_name <<<"$release")"
           fi
-          [[ "$source_tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          # Preserve the published release name, including tags such as 0.01.
+          # Docker tags allow 1-128 ASCII letters, digits, underscores, dots and
+          # hyphens, with a letter, digit or underscore as the first character.
+          if [[ ! "$source_tag" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+            echo "Release tag cannot be used as a Docker image tag: $source_tag" >&2
+            exit 1
+          fi
           {
             echo "DBX_SOURCE_TAG=$source_tag"
             echo "VERSION_TAG=$source_tag"
