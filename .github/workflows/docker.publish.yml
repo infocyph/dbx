@@ -1,0 +1,167 @@
+name: Docker Publish
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: docker-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve stable release source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+          EVENT_RELEASE_DRAFT: ${{ github.event.release.draft }}
+          EVENT_RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          set -euo pipefail
+          publish_release_tag=false
+          if [[ "$EVENT_NAME" == release ]]; then
+            [[ "$EVENT_RELEASE_DRAFT" != true && "$EVENT_RELEASE_PRERELEASE" != true ]]
+            source_tag="$EVENT_RELEASE_TAG"
+            publish_release_tag=true
+          else
+            release="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest")"
+            [[ "$(jq -r .draft <<<"$release")" == false ]]
+            [[ "$(jq -r .prerelease <<<"$release")" == false ]]
+            source_tag="$(jq -r .tag_name <<<"$release")"
+          fi
+          [[ "$source_tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          {
+            echo "DBX_SOURCE_TAG=$source_tag"
+            echo "VERSION_TAG=$source_tag"
+            echo "PUBLISH_RELEASE_TAG=$publish_release_tag"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.DBX_SOURCE_TAG }}
+          persist-credentials: false
+      - name: Capture release revision
+        run: echo "DBX_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - run: bash tests/static.sh
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Pin upstream DBX for this publish run
+        run: |
+          set -euo pipefail
+          digest="$(docker buildx imagetools inspect t8y2/dbx:latest | awk '$1 == "Digest:" {print $2; exit}')"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          echo "DBX_BASE_IMAGE=t8y2/dbx@$digest" >> "$GITHUB_ENV"
+
+      - name: Build amd64 candidate
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          build-args: DBX_BASE_IMAGE=${{ env.DBX_BASE_IMAGE }}
+          tags: infocyph/dbx:publish-candidate-amd64
+          labels: org.opencontainers.image.revision=${{ env.DBX_SOURCE_SHA }}
+      - name: Validate amd64 candidate
+        env:
+          DBX_SMOKE_SKIP_BUILD: "1"
+        run: |
+          bash tests/smoke.sh infocyph/dbx:publish-candidate-amd64
+          bash tests/connections-smoke.sh infocyph/dbx:publish-candidate-amd64
+
+      - name: Build arm64 candidate
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          push: false
+          build-args: DBX_BASE_IMAGE=${{ env.DBX_BASE_IMAGE }}
+          tags: infocyph/dbx:publish-candidate-arm64
+          labels: org.opencontainers.image.revision=${{ env.DBX_SOURCE_SHA }}
+      - name: Validate arm64 candidate
+        env:
+          DBX_SMOKE_SKIP_BUILD: "1"
+        run: |
+          bash tests/smoke.sh infocyph/dbx:publish-candidate-arm64
+          bash tests/connections-smoke.sh infocyph/dbx:publish-candidate-arm64
+
+      - uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Resolve publication tags
+        run: |
+          set -euo pipefail
+          tags=$'docker.io/infocyph/dbx:latest\nghcr.io/infocyph/dbx:latest'
+          if [[ "$PUBLISH_RELEASE_TAG" == true ]]; then
+            for registry in docker.io ghcr.io; do
+              ref="$registry/infocyph/dbx:$VERSION_TAG"
+              if output="$(docker buildx imagetools inspect "$ref" 2>&1)"; then
+                echo "Refusing to overwrite immutable release tag: $ref" >&2
+                exit 1
+              fi
+              if ! grep -Eiq 'manifest unknown|not found|no such manifest|NAME_UNKNOWN' <<<"$output"; then
+                echo "Cannot verify release tag absence: $ref" >&2
+                exit 1
+              fi
+              tags+=$'\n'"$ref"
+            done
+          fi
+          {
+            echo 'DBX_IMAGE_TAGS<<DBX_TAGS_END'
+            printf '%s\n' "$tags"
+            echo 'DBX_TAGS_END'
+          } >> "$GITHUB_ENV"
+
+      - name: Publish validated images
+        id: publish
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: false
+          build-args: DBX_BASE_IMAGE=${{ env.DBX_BASE_IMAGE }}
+          tags: ${{ env.DBX_IMAGE_TAGS }}
+          labels: org.opencontainers.image.revision=${{ env.DBX_SOURCE_SHA }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Verify registry digests
+        env:
+          EXPECTED_DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for registry in docker.io ghcr.io; do
+            digest="$(docker buildx imagetools inspect "$registry/infocyph/dbx:latest" | awk '$1 == "Digest:" {print $2; exit}')"
+            [[ "$digest" == "$EXPECTED_DIGEST" ]]
+          done
+          {
+            echo "Source release: $DBX_SOURCE_TAG"
+            echo "Upstream: $DBX_BASE_IMAGE"
+            echo "Published digest: $EXPECTED_DIGEST"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,59 @@
+name: Check
+
+on:
+  push:
+    branches: [main, master, "feature/**", "plan/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: bash tests/static.sh
+
+  runtime:
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          pull: true
+          push: false
+          tags: infocyph/dbx:ci-${{ matrix.arch }}
+          cache-from: type=gha,scope=check-${{ matrix.arch }}
+          cache-to: type=gha,scope=check-${{ matrix.arch }},mode=max
+      - name: Validate DBX initialization and persistence
+        env:
+          DBX_SMOKE_SKIP_BUILD: "1"
+        run: |
+          bash tests/smoke.sh infocyph/dbx:ci-${{ matrix.arch }}
+          bash tests/connections-smoke.sh infocyph/dbx:ci-${{ matrix.arch }}
