@@ -10,8 +10,11 @@ profiles_volume="dbx-profiles-$suffix"
 pg="dbx-postgres-$suffix"
 mysql="dbx-mysql-$suffix"
 maria="dbx-mariadb-$suffix"
+redis_test="dbx-redis-$suffix"
+mongo_test="dbx-mongo-$suffix"
+es_test="dbx-elasticsearch-$suffix"
 cleanup() {
-  docker rm -f -v "$client" "$pg" "$mysql" "$maria" >/dev/null 2>&1 || true
+  docker rm -f -v "$client" "$pg" "$mysql" "$maria" "$redis_test" "$mongo_test" "$es_test" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
   docker volume rm "$volume" "$profiles_volume" >/dev/null 2>&1 || true
 }
@@ -19,16 +22,19 @@ trap cleanup EXIT
 if [[ "${DBX_SMOKE_SKIP_BUILD:-0}" != 1 ]]; then
   docker build -q -t "$image" "$ROOT" >/dev/null
 fi
+# Match the candidate architecture when QEMU runs it on a different host.
+platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")"
 docker network create "$network" >/dev/null
 docker volume create "$volume" >/dev/null
 docker volume create "$profiles_volume" >/dev/null
 start_client() {
   docker rm -f "$client" >/dev/null 2>&1 || true
-  docker run -d --name "$client" --network "$network" -p 127.0.0.1::4224 \
+  docker run -d --platform "$platform" --name "$client" --network "$network" -p 127.0.0.1::4224 \
     -v "${test_volume:-$volume}:/app/data" -e DBX_PASSWORD=dbx-smoke-password \
     -e POSTGRES_USER=fixture -e POSTGRES_PASSWORD=fixture-password -e POSTGRES_DATABASE=fixturedb \
     -e MYSQL_USER=fixture -e MYSQL_PASSWORD=fixture-password -e MYSQL_DATABASE=fixturedb \
     -e MARIADB_USER=fixture -e MARIADB_PASSWORD=fixture-password -e MARIADB_DATABASE=fixturedb \
+    -e MONGODB_ROOT_USERNAME=fixture -e MONGODB_ROOT_PASSWORD=fixture-password \
     "$@" "$image" >/dev/null
   port="$(docker port "$client" 4224/tcp | sed 's/.*://')"
   export DBX_TEST_URL="http://127.0.0.1:$port"
@@ -41,7 +47,7 @@ start_client() {
 }
 check_api() {
   DBX_TEST_PHASE="$1" python3 - <<'PY'
-import http.cookiejar, json, os, urllib.request
+import base64, http.cookiejar, json, os, urllib.request
 http = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 def api(path, body=None):
     return json.load(http.open(urllib.request.Request(os.environ['DBX_TEST_URL'] + path,
@@ -59,7 +65,7 @@ if phase == 'empty':
         'password': '', 'database': 'manualdb'}]})
 elif phase in ('postgres', 'preserved', 'all'):
     expected = {'manual', 'localdevstack-postgres'}
-    if phase == 'all': expected |= {'localdevstack-mysql', 'localdevstack-mariadb'}
+    if phase == 'all': expected |= {'localdevstack-' + name for name in ('mysql', 'mariadb', 'elasticsearch', 'redis', 'mongodb')}
     assert set(by_id) == expected, list(by_id)
     assert by_id['manual']['name'] == 'Manual connection'
     for service in ('postgres', 'mysql', 'mariadb') if phase == 'all' else ('postgres',):
@@ -78,23 +84,46 @@ elif phase in ('postgres', 'preserved', 'all'):
     else:
         assert by_id['localdevstack-postgres']['name'] == 'My PostgreSQL'
     if phase == 'all':
+        for service, port in (('elasticsearch', 9200), ('redis', 6379), ('mongodb', 27017)):
+            c = by_id['localdevstack-' + service]
+            assert c['host'] == service and c['port'] == port
+            assert c['db_type'] == service and c['driver_profile'] == service
+            assert c['ssl'] is False
+            if service == 'mongodb':
+                assert c['username'] == 'fixture' and c['database'] == 'admin'
+                assert c['url_params'] == 'authSource=admin'
+            else:
+                assert c['username'] == '' and c['password'] == ''
+            api('/api/connection/connect', {'config': c})
+        mongo_id = 'localdevstack-mongodb'
+        assert 'fixturedb' in api('/api/mongo/list-databases', {'connectionId': mongo_id})
+        collections = api('/api/mongo/list-collections', {'connectionId': mongo_id, 'database': 'fixturedb'})
+        assert 'fixture_collection' in [item['name'] for item in collections], collections
+        value = api('/api/redis/get-value', {'connectionId': 'localdevstack-redis', 'db': 0, 'keyRaw': base64.b64encode(b'fixture:key').decode()})
+        assert value['redis_type'] == 'string', value
+        assert base64.b64decode(value['data']['content']['raw_base64']) == b'fixture-value', value
+        indices = api('/api/document-store/list-collections', {'connectionId': 'localdevstack-elasticsearch', 'database': ''})
+        assert 'fixture-index' in [item['name'] for item in indices], indices
         api('/api/connection/save', {'configs': [by_id['manual']],
-            'removedIds': ['localdevstack-postgres', 'localdevstack-mysql', 'localdevstack-mariadb']})
+            'removedIds': [key for key in by_id if key != 'manual']})
 elif phase == 'deleted':
     assert set(by_id) == {'manual'}, list(by_id)
 elif phase == 'profiles':
-    assert set(by_id) == {'localdevstack-postgres', 'localdevstack-mysql', 'localdevstack-mariadb'}, list(by_id)
+    assert set(by_id) == {'localdevstack-' + name for name in ('postgres', 'mysql', 'mariadb', 'elasticsearch', 'redis', 'mongodb')}, list(by_id)
+    assert by_id['localdevstack-mongodb']['url_params'] == 'authSource=admin'
+    assert by_id['localdevstack-redis']['database'] == '0'
+    assert by_id['localdevstack-elasticsearch']['database'] is None
 elif phase == 'optout':
     assert set(by_id) == {'manual'}, list(by_id)
 print('PASS: database initialization phase ' + phase)
 PY
 }
 
-# No SQL service is running; AI initialization must not add offline defaults.
+# No datastore service is running; AI initialization must not add offline defaults.
 start_client
 check_api empty
 # Configured profiles should be saved even before those containers exist.
-test_volume="$profiles_volume" start_client -e LDS_DBX_PROFILES=postgresql,mysql,mariadb
+test_volume="$profiles_volume" start_client -e LDS_DBX_PROFILES=postgresql,mysql,mariadb,elasticsearch,redis,mongodb
 check_api profiles
 
 docker run -d --name "$pg" --network "$network" --network-alias postgres \
@@ -128,6 +157,43 @@ for service in mysql mariadb; do
   docker exec -e MYSQL_PWD=root-fixture-password "$db" "$service" -u root \
     -e "CREATE DATABASE dbx_extra; GRANT ALL ON dbx_extra.* TO 'fixture'@'%';" >/dev/null
 done
+docker run -d --name "$redis_test" --network "$network" --network-alias redis \
+  redis/redis-stack-server:latest >/dev/null
+ready=0
+for _ in {1..90}; do
+  if docker exec "$redis_test" redis-cli ping >/dev/null 2>&1; then ready=1; break; fi
+  sleep 1
+done
+((ready)) || { docker logs "$redis_test" >&2; exit 1; }
+docker exec "$redis_test" redis-cli SET fixture:key fixture-value >/dev/null
+
+docker run -d --name "$mongo_test" --network "$network" --network-alias mongodb \
+  -e MONGO_INITDB_ROOT_USERNAME=fixture -e MONGO_INITDB_ROOT_PASSWORD=fixture-password \
+  "${DBX_TEST_MONGO_IMAGE:-mongo:8.2.11}" >/dev/null
+ready=0
+for _ in {1..120}; do
+  if docker exec "$mongo_test" mongosh --host 127.0.0.1 --quiet \
+    -u fixture -p fixture-password --authenticationDatabase admin \
+    --eval 'db.adminCommand({ping: 1})' >/dev/null 2>&1; then ready=1; break; fi
+  sleep 1
+done
+((ready)) || { docker logs "$mongo_test" >&2; exit 1; }
+docker exec "$mongo_test" mongosh --host 127.0.0.1 --quiet \
+  -u fixture -p fixture-password --authenticationDatabase admin \
+  --eval 'db.getSiblingDB("fixturedb").fixture_collection.insertOne({value: "fixture-value"})' >/dev/null
+
+docker run -d --name "$es_test" --network "$network" --network-alias elasticsearch \
+  -e discovery.type=single-node -e xpack.security.enabled=false \
+  -e node.store.allow_mmap=false -e ES_JAVA_OPTS='-Xms256m -Xmx256m' \
+  docker.elastic.co/elasticsearch/elasticsearch:9.5.4 >/dev/null
+ready=0
+for _ in {1..120}; do
+  if docker exec "$es_test" curl -fsS http://127.0.0.1:9200/_cluster/health >/dev/null 2>&1; then ready=1; break; fi
+  sleep 1
+done
+((ready)) || { docker logs "$es_test" >&2; exit 1; }
+docker exec "$es_test" curl -fsS -X PUT http://127.0.0.1:9200/fixture-index >/dev/null
+
 # Newly started services must be added even though AI and PostgreSQL are marked.
 start_client
 check_api all

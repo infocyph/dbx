@@ -17,7 +17,7 @@ databases=()
 if [[ "${LDS_DBX_DB_PRECONFIGURE:-1}" != 0 ]]; then
   selection=",${LDS_DBX_DATABASES:-auto},"
   profiles=",${LDS_DBX_PROFILES:-},"
-  for service in postgres mysql mariadb; do
+  for service in postgres mysql mariadb elasticsearch redis mongodb; do
     [[ -f "$data_dir/.lds-db-$service-configured" ]] && continue
     profile="$service"
     [[ "$service" == postgres ]] && profile=postgresql
@@ -113,6 +113,7 @@ if ((${#databases[@]})); then
       # Match both our stable ID and an existing connection to this server.
       if ! jq -e --arg id "localdevstack-$service" --arg host "$service" \
         'any(.[]; .id == $id or .host == $host)' "$tmp/connections.json" >/dev/null; then
+        url_params=""
         case "$service" in
         postgres)
           name=PostgreSQL port=5432 db_type=postgres
@@ -129,17 +130,32 @@ if ((${#databases[@]})); then
           username="${MARIADB_USER:-infocyph}" password="${MARIADB_PASSWORD:-12345}"
           database="${MARIADB_DATABASE:-localdb}"
           ;;
+        elasticsearch)
+          name=Elasticsearch port=9200 db_type=elasticsearch
+          username="" password="" database=""
+          ;;
+        redis)
+          name=Redis port=6379 db_type=redis
+          username="" password="" database=0
+          ;;
+        mongodb)
+          name=MongoDB port=27017 db_type=mongodb
+          username="${MONGODB_ROOT_USERNAME:-root}" password="${MONGODB_ROOT_PASSWORD:-12345}"
+          database=admin url_params=authSource=admin
+          ;;
         esac
         # Use environment variables so credentials never appear in process arguments.
         export DBX_SEED_PASSWORD="$password"
         jq -n --arg id "localdevstack-$service" --arg name "LocalDevStack $name" \
           --arg type "$db_type" --arg profile "$service" --arg driver_label "$name" --arg host "$service" --argjson port "$port" \
-          --arg username "$username" --arg database "$database" \
+          --arg username "$username" --arg database "$database" --arg url_params "$url_params" \
           --slurpfile saved "$tmp/connections.json" '
           {configs: ($saved[0] + [{id: $id, name: $name, db_type: $type, host: $host,
             port: $port, driver_profile: $profile, driver_label: $driver_label,
             username: $username, password: env.DBX_SEED_PASSWORD,
-            database: $database, save_password: true}])}
+            database: (if $database == "" then null else $database end),
+            url_params: (if $url_params == "" then null else $url_params end),
+            save_password: true}])}
         ' >"$tmp/connection.json"
         unset DBX_SEED_PASSWORD
         curl --noproxy '*' -fsS --max-time 10 -H 'Content-Type: application/json' \

@@ -71,7 +71,8 @@ jobs:
       - name: Pin upstream DBX for this publish run
         run: |
           set -euo pipefail
-          digest="$(docker buildx imagetools inspect t8y2/dbx:latest | awk '$1 == "Digest:" {print $2; exit}')"
+          inspection="$(docker buildx imagetools inspect t8y2/dbx:latest)"
+          digest="$(awk '$1 == "Digest:" {print $2; exit}' <<<"$inspection")"
           [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
           echo "DBX_BASE_IMAGE=t8y2/dbx@$digest" >> "$GITHUB_ENV"
 
@@ -163,8 +164,14 @@ jobs:
         run: |
           set -euo pipefail
           for registry in docker.io ghcr.io; do
-            digest="$(docker buildx imagetools inspect "$registry/infocyph/dbx:latest" | awk '$1 == "Digest:" {print $2; exit}')"
-            [[ "$digest" == "$EXPECTED_DIGEST" ]]
+            # Read the whole output before parsing: an early pipe exit can
+            # make Buildx return 255 even when it printed the correct digest.
+            inspection="$(docker buildx imagetools inspect "$registry/infocyph/dbx:latest")"
+            digest="$(awk '$1 == "Digest:" {print $2; exit}' <<<"$inspection")"
+            if [[ "$digest" != "$EXPECTED_DIGEST" ]]; then
+              echo "Digest mismatch for $registry: expected $EXPECTED_DIGEST, got $digest" >&2
+              exit 1
+            fi
           done
           {
             echo "Source release: $DBX_SOURCE_TAG"

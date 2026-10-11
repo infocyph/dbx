@@ -1,6 +1,6 @@
 # DBX for LocalDevStack
 
-Custom Docker image based on [upstream DBX](https://github.com/t8y2/dbx), with a
+Custom Docker image based on [upstream DBX](https://github.com/t8y2/dbx), with
 saved database connections and an AI configuration for LocalDevStack's local model service.
 
 Images: `docker.io/infocyph/dbx:latest` and `ghcr.io/infocyph/dbx:latest`.
@@ -23,14 +23,21 @@ The image supplies the database assistant; the model server runs separately.
 DBX and LocalDevStack's `llm` service must share a Docker network. The common
 `llm:11434` endpoint works with either Ollama or FastFlow.
 
-The wrapper also saves PostgreSQL, MySQL, and MariaDB connections with the stack's
-configured credentials and internal ports (5432/3306). In automatic mode it selects
-services in `LDS_DBX_PROFILES` or available through Docker DNS on the shared network.
+The wrapper saves connections for PostgreSQL, MySQL, MariaDB, Elasticsearch,
+Redis, and MongoDB using LocalDevStack's datastore settings and internal ports.
+SQL connections use the configured database users. Elasticsearch uses plain HTTP
+on `elasticsearch:9200` with no authentication. Redis uses `redis:6379`, database
+`0`, with no authentication. MongoDB uses `mongodb:27017` with the configured root
+credentials and `authSource=admin`, initially selecting the `admin` database.
+In automatic mode it selects services in `LDS_DBX_PROFILES` or available through Docker DNS on the shared network.
 Each service has its own initialization marker: new services are added on a later
 restart without changing existing connections or restoring ones you deleted.
 A previously saved connection to the same hostname is preserved instead of duplicated.
 DBX lists the databases and schemas the account can access when you connect or refresh.
 MySQL and MariaDB use application users, whose database permissions apply.
+
+These Redis and Elasticsearch defaults match LocalDevStack's unauthenticated
+services. If you enable authentication yourself, edit the saved connection in DBX.
 
 Adding a container after DBX starts requires restarting DBX to add the connection.
 Configured services may appear offline while starting. Updating environment credentials
@@ -41,11 +48,12 @@ after initialization does not change saved connections; edit them in DBX instead
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `LDS_DBX_DB_PRECONFIGURE` | `1` | Set to `0` to disable database connection initialization. |
-| `LDS_DBX_DATABASES` | `auto` | Automatic selection or a comma-separated subset of `postgres,mysql,mariadb`. |
-| `LDS_DBX_PROFILES` | unset | In automatic mode, SQL profiles selected in Compose (`postgresql,mysql,mariadb`). |
+| `LDS_DBX_DATABASES` | `auto` | Automatic selection or a comma-separated subset of `postgres,mysql,mariadb,elasticsearch,redis,mongodb`. |
+| `LDS_DBX_PROFILES` | unset | In automatic mode, datastore profiles selected in Compose (`postgresql,mysql,mariadb,elasticsearch,redis,mongodb`). |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE` | `postgres`, `postgres`, `postgres` | Initial PostgreSQL connection credentials and database. |
 | `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` | `infocyph`, `12345`, `localdb` | Initial MySQL connection credentials and database. |
 | `MARIADB_USER`, `MARIADB_PASSWORD`, `MARIADB_DATABASE` | `infocyph`, `12345`, `localdb` | Initial MariaDB connection credentials and database. |
+| `MONGODB_ROOT_USERNAME`, `MONGODB_ROOT_PASSWORD` | `root`, `12345` | Initial MongoDB credentials, authenticated against `admin`. |
 | `LDS_DBX_AI_PRECONFIGURE` | `1` | Set to `0` to disable initial AI configuration. |
 | `LDS_AI_MODEL` | `qwen3.5:9b` | Initial model; later edits belong to DBX settings. |
 | `LDS_AI_THINK` | unset | Initial thinking override: `true` or `false`; unset retains DBX's default. |
@@ -79,9 +87,14 @@ The smoke test uses isolated containers and a mock LLM to check AI initializatio
 real API calls, web authentication, persistence, preserving existing settings,
 and respecting deliberately deleted configurations. It requires Docker, Python 3,
 and curl on the host; it does not require AI hardware or a downloaded model.
-The database smoke test runs real PostgreSQL, MySQL, and MariaDB servers on an isolated
-network. It verifies credential forwarding, database enumeration, later service
-activation, preserving manual connections and edits, opt-outs, and deletion persistence.
+The database smoke test runs real PostgreSQL, MySQL, MariaDB, Elasticsearch, Redis,
+and MongoDB servers on an isolated network. It verifies credential forwarding,
+database enumeration, MongoDB collections, Redis values, Elasticsearch indices,
+later service activation, preserving manual connections and edits, opt-outs, and deletion persistence.
+The MongoDB test fixture is `mongo:8.2.11`. Set `DBX_TEST_MONGO_IMAGE` to test another
+image, for example `DBX_TEST_MONGO_IMAGE=mongo:latest bash tests/connections-smoke.sh`.
+MongoDB images affected by [SERVER-136272](https://jira.mongodb.org/browse/SERVER-136272)
+may refuse startup on newer host kernels; the integration fixture uses the 8.2 series.
 
 The Check workflow validates both supported architectures. Docker Publish runs on
 a published stable release, manual dispatch, and weekly refresh. Manual/scheduled

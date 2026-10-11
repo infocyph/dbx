@@ -19,6 +19,8 @@ trap cleanup EXIT
 if [[ "${DBX_SMOKE_SKIP_BUILD:-0}" != 1 ]]; then
   docker build -q -t "$image" "$ROOT" >/dev/null
 fi
+# Match the candidate architecture when QEMU runs it on a different host.
+platform="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")"
 docker build -q -t infocyph-dbx-mock-llm:ci "$ROOT/tests/fixtures/mock-llm" >/dev/null
 docker network create "$network" >/dev/null
 docker volume create "$volume" >/dev/null
@@ -29,7 +31,7 @@ start_client() {
   local data_volume="$1"
   shift
   docker rm -f "$client" >/dev/null 2>&1 || true
-  docker run -d --name "$client" --network "$network" -p 127.0.0.1::4224 \
+  docker run -d --platform "$platform" --name "$client" --network "$network" -p 127.0.0.1::4224 \
     -v "$data_volume:/app/data" "$@" "$image" >/dev/null
   port="$(docker port "$client" 4224/tcp | sed 's/.*://')"
   export DBX_TEST_URL="http://127.0.0.1:$port"

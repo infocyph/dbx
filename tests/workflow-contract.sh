@@ -5,14 +5,17 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 # Execute the workflow's actual resolver so this covers changes to CI itself.
-awk '
-  /^      - name: Resolve stable release source$/ { step=1; next }
-  step && /^        run: \|$/ { script=1; next }
-  script && /^          / { sub(/^          /, ""); print; next }
-  script && /^$/ { print; next }
-  script { exit }
-' "$ROOT/.github/workflows/docker.publish.yml" >"$tmp/resolve.sh"
-[[ -s "$tmp/resolve.sh" ]]
+extract_step() {
+  awk -v step_name="$1" '
+    $0 == "      - name: " step_name { step=1; next }
+    step && /^        run: \|$/ { script=1; next }
+    script && /^          / { sub(/^          /, ""); print; next }
+    script && /^$/ { print; next }
+    script { exit }
+  ' "$ROOT/.github/workflows/docker.publish.yml" >"$2"
+  [[ -s "$2" ]]
+}
+extract_step 'Resolve stable release source' "$tmp/resolve.sh"
 gh() {
   [[ "$*" == 'api repos/fixture/dbx/releases/latest' ]] || return 1
   printf '%s\n' "$MOCK_RELEASE_JSON"
@@ -55,3 +58,43 @@ if EVENT_NAME=workflow_dispatch EVENT_RELEASE_TAG='' bash "$tmp/resolve.sh" >"$t
   exit 1
 fi
 printf 'Publish resolver checks passed.\n'
+
+# Reproduce a producer that keeps writing after the digest line. Piping this
+# directly to an early-exiting awk causes a broken pipe under `pipefail`.
+extract_step 'Pin upstream DBX for this publish run' "$tmp/pin.sh"
+extract_step 'Verify registry digests' "$tmp/verify.sh"
+docker() {
+  [[ "$*" == 'buildx imagetools inspect '* ]] || return 1
+  if [[ "${MOCK_INSPECT_FAILURE:-0}" == 1 ]]; then return 42; fi
+  python3 - <<'PY'
+import os, sys
+try:
+    print('Name: fixture/dbx:latest', flush=True)
+    print('Digest: ' + os.environ['MOCK_MANIFEST_DIGEST'], flush=True)
+    sys.stdout.write('  Platform: linux/arm64\n' * 8192)
+    sys.stdout.flush()
+except BrokenPipeError:
+    os._exit(255)
+PY
+}
+export -f docker
+MOCK_MANIFEST_DIGEST="sha256:$(printf '%064d' 0)"
+export MOCK_MANIFEST_DIGEST
+export EXPECTED_DIGEST="$MOCK_MANIFEST_DIGEST"
+export GITHUB_STEP_SUMMARY="$tmp/summary"
+export DBX_SOURCE_TAG=0.01
+export DBX_BASE_IMAGE="t8y2/dbx@$MOCK_MANIFEST_DIGEST"
+bash "$tmp/pin.sh"
+grep -Fxq "DBX_BASE_IMAGE=$DBX_BASE_IMAGE" "$GITHUB_ENV"
+bash "$tmp/verify.sh"
+if EXPECTED_DIGEST=sha256:wrong bash "$tmp/verify.sh" >"$tmp/out" 2>"$tmp/err"; then
+  printf 'Registry verification accepted a mismatched digest.\n' >&2
+  exit 1
+fi
+for step in pin verify; do
+  if MOCK_INSPECT_FAILURE=1 bash "$tmp/$step.sh" >"$tmp/out" 2>"$tmp/err"; then
+    printf 'Workflow ignored an inspection failure in %s.\n' "$step" >&2
+    exit 1
+  fi
+done
+printf 'Publish digest inspection checks passed.\n'
